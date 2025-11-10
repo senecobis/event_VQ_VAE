@@ -1,67 +1,34 @@
-from math import log2, sqrt
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-import numpy as np
 import sys
 from einops import rearrange
+from .utils.utils_general import exists, default, eval_decorator
+from .base.vae import VAEEncoder, VAEDecoder
 
 # from utils import utils_distributed
-
-# helpers
-def exists(val):
-    return val is not None
-
-def default(val, d):
-    return val if exists(val) else d
-
-def eval_decorator(fn):
-    def inner(model, *args, **kwargs):
-        was_training = model.training
-        model.eval()
-        out = fn(model, *args, **kwargs)
-        model.train(was_training)
-        return out
-    return inner
-
-# discrete vae class
-
-class ResBlock(nn.Module):
-    def __init__(self, chan):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(chan, chan, 3, padding = 1),
-            nn.ReLU(),
-            nn.Conv2d(chan, chan, 3, padding = 1),
-            nn.ReLU(),
-            nn.Conv2d(chan, chan, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x) + x
 
 class DiscreteVAE(nn.Module):
     def __init__(
         self,
-        input_H = 256,
-        input_W = 256,
-        num_tokens = 512,
-        codebook_dim = 512,
-        num_layers = 3,
-        num_resnet_blocks = 0,
-        hidden_dim = 64,
-        channels = 3,
-        loss = 'mse',
-        temperature = 0.9,
-        straight_through = False,
-        kl_div_loss_weight = 0.,
-        normalization = None
+        input_H = 256,              # Input image size
+        input_W = 256,              # Input image size
+        num_tokens = 512,           # Quantization levels, i.e. vocabulary size the image is encoded in a maximum of "num_tokens" ways
+        codebook_dim = 512,         # Dimension of codebook vectors
+        num_layers = 3,             # Number of layers / downsampling factor of 2^num_layers
+        num_resnet_blocks = 0,      # Number of ResNet blocks per layer
+        hidden_dim = 64,            # Base hidden dimension of the model
+        channels = 3,               # Number of input channels
+        loss = 'mse',               # Reconstruction loss to use: 'mse', 'smooth_l1', 'cosine'
+        temperature = 0.9,          # Gumbel softmax temperature
+        straight_through = False,   # Whether to use straight through gradient estimation
+        kl_div_loss_weight = 0.,    # Weight of the KL divergence loss
+        normalization = None        # Tuple of channel-wise mean and std to use for normalization, e.g. ([0.5]*3, [0.5]*3) for imagenet pre-trained models
     ):
         super().__init__()
         assert (input_H % (2**num_layers)) == 0 and (input_W % (2**num_layers)) == 0, 'input size has to be divisible by num_layers'
         assert num_layers >= 1, 'number of layers must be greater than or equal to 1'
-        has_resblocks = num_resnet_blocks > 0
- 
+
         self.input_H = input_H
         self.input_W = input_W
         self.input_size = (input_H, input_W)
@@ -70,39 +37,28 @@ class DiscreteVAE(nn.Module):
         self.temperature = temperature
         self.straight_through = straight_through
         self.codebook = nn.Embedding(num_tokens, codebook_dim)
-        hdim = hidden_dim
 
-        enc_chans = [hidden_dim] * num_layers
-        dec_chans = list(reversed(enc_chans))
+        # encoder / decoder modules
+        self.encoder = VAEEncoder(
+            in_channels=channels,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_resnet_blocks=num_resnet_blocks,
+            num_tokens=num_tokens
+        )
+        self.decoder = VAEDecoder(
+            codebook_dim=codebook_dim,
+            out_channels=channels,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_resnet_blocks=num_resnet_blocks
+        )
 
-        enc_chans = [channels, *enc_chans]
-
-        dec_init_chan = codebook_dim if not has_resblocks else dec_chans[0]
-        dec_chans = [dec_init_chan, *dec_chans]
-
-        enc_chans_io, dec_chans_io = map(lambda t: list(zip(t[:-1], t[1:])), (enc_chans, dec_chans))
-
-        enc_layers = []
-        dec_layers = []
-
-        for (enc_in, enc_out), (dec_in, dec_out) in zip(enc_chans_io, dec_chans_io):
-            enc_layers.append(nn.Sequential(nn.Conv2d(enc_in, enc_out, 4, stride = 2, padding = 1), nn.ReLU()))
-            dec_layers.append(nn.Sequential(nn.ConvTranspose2d(dec_in, dec_out, 4, stride = 2, padding = 1), nn.ReLU()))
-
-        for _ in range(num_resnet_blocks):
-            dec_layers.insert(0, ResBlock(dec_chans[1]))
-            enc_layers.append(ResBlock(enc_chans[-1]))
-
-        if num_resnet_blocks > 0:
-            dec_layers.insert(0, nn.Conv2d(codebook_dim, dec_chans[1], 1))
-
-        enc_layers.append(nn.Conv2d(enc_chans[-1], num_tokens, 1))
-        dec_layers.append(nn.Conv2d(dec_chans[-1], channels, 1))
-
-        self.encoder = nn.Sequential(*enc_layers)
-        self.decoder = nn.Sequential(*dec_layers)
-
-        loss_functions = { 'mse': F.mse_loss, 'smooth_l1': F.smooth_l1_loss, 'cosine': self.cosine_reconstruction_loss }
+        loss_functions = {
+            'mse': F.mse_loss,
+            'smooth_l1': F.smooth_l1_loss,
+            'cosine': self.cosine_reconstruction_loss
+        }
         self.loss_fn = loss_functions[loss]
         self.kl_div_loss_weight = kl_div_loss_weight
 
@@ -263,8 +219,3 @@ def evaluate(data_loader, model, device):
     stats[f'codebook_indices'] = len(codebook_indices_test)
     return stats
         
-if __name__ == '__main__':
-    vae = DiscreteVAE(input_H=256, input_W=256, channels=2, num_layers=3)
-    img = torch.randn(10, 2, 256, 256)
-    loss, recons = vae(img, return_loss = True, return_recons = True)
-    print(loss)
