@@ -27,9 +27,11 @@ class VAEEncoder(nn.Module):
                 nn.ReLU()
             ))
             c_in = hidden_dim
+        
         # optional ResBlocks at bottleneck
         for _ in range(num_resnet_blocks):
             layers.append(ResBlock(hidden_dim))
+        
         # produce logits over codebook tokens
         layers.append(nn.Conv2d(hidden_dim, num_tokens, kernel_size=1))
         self.net = nn.Sequential(*layers)

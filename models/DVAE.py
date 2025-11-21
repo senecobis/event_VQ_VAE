@@ -8,7 +8,7 @@ from .base.vae import VAEEncoder, VAEDecoder
 
 # from utils import utils_distributed
 
-class DiscreteVAE(nn.Module):
+class DVAE(nn.Module):
     def __init__(
         self,
         input_H = 256,              # Input image size
