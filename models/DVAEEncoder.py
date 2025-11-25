@@ -65,4 +65,4 @@ class DVAEEncoder(nn.Module):
                                         hard=self.straight_through
                                         ) # (B, 8192, H, W)
         sampled = einsum('b n h w, n d -> b d h w', soft_one_hot, self.codebook.weight)
-        return sampled
+        return sampled, logits

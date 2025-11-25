@@ -77,8 +77,8 @@ class PatchDVAE(DVAE):
                 w=self.patch_grid_W
             )
 
-            logits_list = []
-            
+            all_sampled = []
+            all_logits = []
             # Iterate through patches and their corresponding encoders
             for i in range(self.num_patches):
                 # Extract the specific patch i for the whole batch
@@ -86,14 +86,22 @@ class PatchDVAE(DVAE):
                 
                 # Pass through the i-th encoder
                 # Output shape: (B, num_tokens, h_latent, w_latent)
-                patch_logits = self.encoders[i](patch_input)
-                logits_list.append(patch_logits)
+                sampled, logits = self.encoders[i](patch_input)
+                all_sampled.append(sampled)
+                all_logits.append(logits)
 
             # Stack logits: (B, num_patches, num_tokens, h_latent, w_latent)
-            stacked_logits = torch.stack(logits_list, dim=1)
+            stacked_sampled = torch.stack(all_sampled, dim=1)
+            stacked_logits = torch.stack(all_logits, dim=1)
 
             # Stitch logits back to full spatial resolution
             # (B, (h w), n, lh, lw) -> (B, n, (h lh), (w lw))
+            full_sampled = rearrange(
+                stacked_sampled,
+                'b (h w) n lh lw -> b n (h lh) (w lw)',
+                h=self.patch_grid_H,
+                w=self.patch_grid_W
+            )
             full_logits = rearrange(
                 stacked_logits,
                 'b (h w) n lh lw -> b n (h lh) (w lw)',
@@ -101,22 +109,31 @@ class PatchDVAE(DVAE):
                 w=self.patch_grid_W
             )
             
-            return full_logits
+            return full_sampled, full_logits
+    
+    def kl_divergence(
+        self,
+        logits
+    ):
+        device, num_tokens = logits.device, self.num_tokens
+
+        logits = rearrange(logits, 'b n h w -> b (h w) n')
+        log_qy = F.log_softmax(logits, dim = -1)
+        log_uniform = torch.log(torch.tensor([1. / num_tokens], device = device))
+        kl_div = F.kl_div(log_uniform, log_qy, None, None, 'batchmean', log_target = True)
+
+        return kl_div
     
     def forward( 
         self,
         img,
         return_loss = False,
         return_recons = False,
-        return_logits = False,
-        temp = None
     ):
-        device, num_tokens, input_H, input_W, kl_div_loss_weight = img.device, self.num_tokens, self.input_H, self.input_W, self.kl_div_loss_weight
-        assert img.shape[-1] == input_W and img.shape[-2] == input_H, f'input must have the correct image size {input_H}x{input_W}, but is ({img.shape[-2]},{img.shape[-1]})'
+        kl_div_loss_weight = self.kl_div_loss_weight
 
         img = self.norm(img)
-
-        sampled = self.encode_patches(img)
+        sampled, logits = self.encode_patches(img)
         out = self.decoder(sampled)
 
         if not return_loss:
@@ -126,10 +143,7 @@ class PatchDVAE(DVAE):
         recon_loss = self.loss_fn(img, out)
 
         # kl divergence
-        logits = rearrange(logits, 'b n h w -> b (h w) n')
-        log_qy = F.log_softmax(logits, dim = -1)
-        log_uniform = torch.log(torch.tensor([1. / num_tokens], device = device))
-        kl_div = F.kl_div(log_uniform, log_qy, None, None, 'batchmean', log_target = True)
+        kl_div = self.kl_divergence(logits=logits)
 
         loss = recon_loss + (kl_div * kl_div_loss_weight)
 
@@ -137,4 +151,18 @@ class PatchDVAE(DVAE):
             return loss
 
         return loss, out        
+    
+if __name__ == '__main__':
+    # vae = DVAE(input_H=256, input_W=256, channels=2, num_layers=3)
+    # img = torch.randn(10, 2, 256, 256) # batch of 10 images, 2 channels, 256x256
+    # loss, recons = vae(img, return_loss = True, return_recons = True)
+    # print(recons.shape)
+    
+    patch_vae = PatchDVAE(input_H=256, input_W=256, channels=2, num_layers=3, patch_grid_H=2, patch_grid_W=2, codebook_dim=64)
+    img = torch.randn(4, 2, 256, 256) # batch of 4 images, 2 channels, 256x256
+    out = patch_vae(img)
+    # loss, recons = patch_vae(img, return_loss = True, return_recons = True)
+    # print(recons.shape)
+    print(f"Original image shape: {img.shape}")
+    print(f"Encoded tokens shape: {out.shape}")  # Expected shape: (4, 4, H', W') where H' and W' depend on the encoder output size
     
