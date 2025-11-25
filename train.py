@@ -1,3 +1,4 @@
+import json
 import os
 from tqdm import tqdm
 from datetime import datetime
@@ -11,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.cuda.amp import GradScaler, autocast
 
-
+from ev_loader.DSEC_dataloader.provider import DatasetProvider
 from models.PatchDVAE import PatchDVAE
 
 class PatchDVAETrainer:
@@ -23,9 +24,9 @@ class PatchDVAETrainer:
         learning_rate: float = 1e-4,
         num_epochs: int = 100,
         save_every: int = 10,
-        checkpoint_dir: str = "./checkpoints",
         use_amp: bool = True,
         n_workers: int = 4,
+        checkpoint_dir: str = "checkpoints",
     ):
         self.batch_size = batch_size
         self.num_epochs = num_epochs
@@ -68,11 +69,12 @@ class PatchDVAETrainer:
         if self.is_main_process:
             # Model name for saving
             now = datetime.now()
-            run_id = now.strftime("%Y%m%d_%H%M%S")
+            run_id = now.strftime("%Y-%m-%d_%H-%M")
             self.model_name = f"dvae_{run_id}"
+
             os.makedirs(self.checkpoint_dir, exist_ok=True)
             print(f"Trainer initialized on {torch.cuda.device_count()} GPUs.")
-
+    
     def _setup_ddp(self):
         """Initializes the distributed process group."""
         # torchrun sets these env variables
@@ -98,7 +100,9 @@ class PatchDVAETrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "loss": loss,
         }
-        path = os.path.join(self.checkpoint_dir, f"{self.model_name}_epoch_{epoch}.pt")
+        path = os.path.join(self.checkpoint_dir, f"{self.model_name}" ,f"epoch_{epoch}.pth")
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
         torch.save(checkpoint, path)
         print(f"Saved checkpoint to {path}")
 
@@ -113,15 +117,15 @@ class PatchDVAETrainer:
 
         for batch in iterator:
             # Handle case where dataset returns (img, label) or just img
-            imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
-            imgs = imgs.to(self.device)
+            event_imgs = batch["representation"]["left"]
+            event_imgs = event_imgs.to(self.device)
 
             self.optimizer.zero_grad()
 
             # Mixed Precision Forward Pass
             with autocast(enabled=self.use_amp):
                 # forward returns scalar loss because return_loss=True
-                loss = self.model(imgs, return_loss=True)
+                loss = self.model(event_imgs, return_loss=True)
 
             # Backward Pass
             self.scaler.scale(loss).backward()
@@ -146,7 +150,7 @@ class PatchDVAETrainer:
             avg_loss = self.train_epoch(epoch)
             
             if self.is_main_process:
-                print(f"Epoch {epoch} | Average Loss: {avg_loss:.4f}")
+                print(f"Epoch {epoch} | Average Loss: {avg_loss:.4f}\n")
             
             if epoch % self.save_every == 0:
                 self.save_checkpoint(epoch, avg_loss)
@@ -161,14 +165,27 @@ def main():
     # 1. Define Hyperparameters
     H, W = 256, 256
     BATCH_SIZE = 64
+    config_dir = 'configs/base.json'
     
+    # Open the real dataset
+    with open(config_dir, 'r') as f:
+        config = json.load(f)
+        
+    provider = DatasetProvider(
+        dataset_path=config["data"]["path"],
+        representation=config["data"]["representation"],
+        num_bins=config["data"]["voxel_bins"],
+        delta_t_ms=config["data"]["event_dt_ms"]
+    )
+    dataset = provider.get_train_dataset(load_opt_flow=False)
+
     # 2. Create Dummy Dataset (Replace with real data)
-    transform = transforms.Compose([
-        transforms.Resize((H, W)),
-        transforms.ToTensor(),
-    ])
     # Example: CIFAR or ImageFolder
-    dataset = datasets.FakeData(size=1000, image_size=(2, H, W), transform=transform)
+    # transform = transforms.Compose([
+    #     transforms.Resize((H, W)),
+    #     transforms.ToTensor(),
+    # ])
+    # dataset = datasets.FakeData(size=1000, image_size=(2, H, W), transform=transform)
 
     # 3. Initialize Model
     model = PatchDVAE(

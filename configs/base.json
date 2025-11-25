@@ -1,0 +1,21 @@
+{
+  "data": {
+    "path": "/data/scratch/pellerito/datasets/DSEC",
+    "mode": "time",
+    "sequence_len": 1,
+    "representation": "voxel",
+    "event_dt_ms": 50,
+    "voxel_bins": 2
+  },
+  "model": {
+  }, 
+  "loss": {
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "lr": 0.001
+  },
+  "vis": {
+  }
+}
+  

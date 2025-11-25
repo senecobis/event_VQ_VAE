@@ -42,13 +42,17 @@ class PatchDVAE(DVAE):
         assert patch_grid_H >= 1 and patch_grid_W >= 1, 'number of patches must be greater than or equal to 1'
         assert (input_H % patch_grid_H) == 0 and (input_W % patch_grid_W) == 0, 'input size has to be divisible by patch grid size'
 
+        # Delete the parent's codebook to save memory
+        if hasattr(self, 'codebook'):
+            del self.codebook
+
         self.patch_grid_H = patch_grid_H
         self.patch_grid_W = patch_grid_W
 
         # 1. Multiple Encoders (One for each patch position)
         # Total encoders = patch_grid_H * patch_grid_W
         self.num_patches = patch_grid_H * patch_grid_W
-        self.encoders = nn.ModuleList([
+        self.encoder = nn.ModuleList([
             DVAEEncoder(
                 input_H = input_H // patch_grid_H,
                 input_W = input_W // patch_grid_W,
@@ -86,7 +90,7 @@ class PatchDVAE(DVAE):
                 
                 # Pass through the i-th encoder
                 # Output shape: (B, num_tokens, h_latent, w_latent)
-                sampled, logits = self.encoders[i](patch_input)
+                sampled, logits = self.encoder[i](patch_input)
                 all_sampled.append(sampled)
                 all_logits.append(logits)
 
