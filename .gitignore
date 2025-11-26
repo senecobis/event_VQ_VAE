@@ -2,3 +2,5 @@ launch.json
 *.vscode/
 *.pyc
 checkpoints
+*.log
+wandb
