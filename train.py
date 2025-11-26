@@ -1,5 +1,6 @@
 import json
 import os
+import wandb  # <--- IMPORT WANDB
 from tqdm import tqdm
 from datetime import datetime
 from torchvision import datasets, transforms
@@ -27,6 +28,8 @@ class PatchDVAETrainer:
         use_amp: bool = True,
         n_workers: int = 4,
         checkpoint_dir: str = "checkpoints",
+        wandb_config: dict = None,  
+        project_name: str = "implict-kernel" 
     ):
         self.batch_size = batch_size
         self.num_epochs = num_epochs
@@ -41,9 +44,6 @@ class PatchDVAETrainer:
         self.device = torch.device(f"cuda:{self.local_rank}")
         self.model = model.to(self.device)
         
-        # DDP Wrapper
-        # find_unused_parameters=True is often needed if some patches/encoders 
-        # aren't activated in every forward pass, though likely False is fine here.
         self.model = DDP(
             self.model, 
             device_ids=[self.local_rank], 
@@ -51,13 +51,13 @@ class PatchDVAETrainer:
             find_unused_parameters=False 
         )
 
-        # 3. Prepare Data Loader with DistributedSampler
+        # 3. Prepare Data Loader
         self.sampler = DistributedSampler(dataset, shuffle=True)
         self.dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             pin_memory=True,
-            shuffle=False, # Sampler handles shuffling
+            shuffle=False,
             sampler=self.sampler,
             num_workers=n_workers
         )
@@ -66,6 +66,7 @@ class PatchDVAETrainer:
         self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
         self.scaler = GradScaler(enabled=use_amp)
 
+        # ### WANDB INITIALIZATION ###
         if self.is_main_process:
             # Model name for saving
             now = datetime.now()
@@ -74,10 +75,18 @@ class PatchDVAETrainer:
 
             os.makedirs(self.checkpoint_dir, exist_ok=True)
             print(f"Trainer initialized on {torch.cuda.device_count()} GPUs.")
+
+            wandb.init(
+                project=project_name,
+                name=self.model_name,
+                config=wandb_config,
+                # reinit=True
+            )
+            # Optional: Watch gradients (can slow down training slightly)
+            # wandb.watch(self.model, log="all")
     
     def _setup_ddp(self):
         """Initializes the distributed process group."""
-        # torchrun sets these env variables
         self.rank = int(os.environ["RANK"])
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
@@ -90,13 +99,12 @@ class PatchDVAETrainer:
         return self.rank == 0
 
     def save_checkpoint(self, epoch, loss):
-        """Saves model state. Only called by main process."""
         if not self.is_main_process:
             return
             
         checkpoint = {
             "epoch": epoch,
-            "model_state_dict": self.model.module.state_dict(), # Note .module for DDP
+            "model_state_dict": self.model.module.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "loss": loss,
         }
@@ -105,52 +113,68 @@ class PatchDVAETrainer:
             os.makedirs(os.path.dirname(path))
         torch.save(checkpoint, path)
         print(f"Saved checkpoint to {path}")
+        
+        # ### WANDB LOGGING ###
+        # Log the artifact (optional, but good for version control)
+        # wandb.save(path)
 
     def train_epoch(self, epoch):
         self.model.train()
-        # Important: Set epoch for sampler to ensure shuffling changes every epoch
         self.sampler.set_epoch(epoch)
         
         epoch_loss = 0.0
-        # Only show progress bar on main process
         iterator = tqdm(self.dataloader, desc=f"Epoch {epoch}") if self.is_main_process else self.dataloader
 
+        # We keep track of steps to log to wandb frequently
+        step_count = 0
+
         for batch in iterator:
-            # Handle case where dataset returns (img, label) or just img
             event_imgs = batch["representation"]["left"]
             event_imgs = event_imgs.to(self.device)
 
             self.optimizer.zero_grad()
 
-            # Mixed Precision Forward Pass
             with autocast(enabled=self.use_amp):
-                # forward returns scalar loss because return_loss=True
+                # Ensure your model forward returns the loss when return_loss=True
                 loss = self.model(event_imgs, return_loss=True)
 
-            # Backward Pass
             self.scaler.scale(loss).backward()
-            
-            # Gradient Clipping (Optional but recommended for VAEs)
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            epoch_loss += loss.item()
+            current_loss = loss.item()
+            epoch_loss += current_loss
             
             if self.is_main_process:
-                iterator.set_postfix({"loss": loss.item()})
+                # Update tqdm
+                iterator.set_postfix({"loss": current_loss})
+                
+                # ### WANDB LOGGING ###
+                # Log batch loss (and Learning Rate if using a scheduler)
+                wandb.log({
+                    "batch_train_loss": current_loss, 
+                    "epoch": epoch,
+                    "lr": self.optimizer.param_groups[0]['lr']
+                })
+
+            step_count += 1
 
         return epoch_loss / len(self.dataloader)
 
     def train(self):
-        """Main training loop."""
         for epoch in range(1, self.num_epochs + 1):
             avg_loss = self.train_epoch(epoch)
             
             if self.is_main_process:
                 print(f"Epoch {epoch} | Average Loss: {avg_loss:.4f}\n")
+                
+                # ### WANDB LOGGING ###
+                wandb.log({
+                    "epoch_train_loss": avg_loss,
+                    "epoch": epoch
+                })
             
             if epoch % self.save_every == 0:
                 self.save_checkpoint(epoch, avg_loss)
@@ -158,39 +182,29 @@ class PatchDVAETrainer:
         self._cleanup()
 
     def _cleanup(self):
+        if self.is_main_process:
+            wandb.finish() # ### WANDB FINISH ###
         destroy_process_group()
 
 
 def main():
-    # 1. Define Hyperparameters
-    H, W = 256, 256
-    BATCH_SIZE = 64
     config_dir = 'configs/base.json'
     
-    # Open the real dataset
     with open(config_dir, 'r') as f:
-        config = json.load(f)
+        file_config = json.load(f)
         
     provider = DatasetProvider(
-        dataset_path=config["data"]["path"],
-        representation=config["data"]["representation"],
-        num_bins=config["data"]["voxel_bins"],
-        delta_t_ms=config["data"]["event_dt_ms"]
+        dataset_path=file_config["data"]["path"],
+        representation=file_config["data"]["representation"],
+        num_bins=file_config["data"]["voxel_bins"],
+        delta_t_ms=file_config["data"]["event_dt_ms"]
     )
     dataset = provider.get_train_dataset(load_opt_flow=False)
 
-    # 2. Create Dummy Dataset (Replace with real data)
-    # Example: CIFAR or ImageFolder
-    # transform = transforms.Compose([
-    #     transforms.Resize((H, W)),
-    #     transforms.ToTensor(),
-    # ])
-    # dataset = datasets.FakeData(size=1000, image_size=(2, H, W), transform=transform)
-
     # 3. Initialize Model
     model = PatchDVAE(
-        input_H = H,
-        input_W = W,
+        input_H = file_config["data"]["height"],
+        input_W = file_config["data"]["width"],
         num_tokens = 512,
         codebook_dim = 512,
         num_layers = 3,
@@ -202,18 +216,34 @@ def main():
         straight_through = False,
         kl_div_loss_weight = 0.,
         normalization = None,
-        patch_grid_H=2,             # Number of patches along height (e.g., 2)
-        patch_grid_W=2,             # Number of patches along width (e.g., 2)
+        patch_grid_H=2,
+        patch_grid_W=2,
     )
+
+    # ### PREPARE WANDB CONFIG ###
+    # Consolidate parameters to pass to wandb.config
+    wandb_config = {
+        "batch_size": file_config["data"]["batch_size"],
+        "lr": file_config["optimizer"]["lr"],
+        "epochs": file_config["optimizer"]["epochs"],
+        "image_height": file_config["data"]["height"],
+        "image_width": file_config["data"]["width"],
+        "model_architecture": "PatchDVAE",
+        "dataset_config": file_config
+    }
 
     # 4. Initialize Trainer and Fit
     trainer = PatchDVAETrainer(
         model=model,
         dataset=dataset,
-        batch_size=BATCH_SIZE,
-        num_epochs=50,
-        save_every=1,
-        checkpoint_dir="checkpoints"
+        batch_size=file_config["data"]["batch_size"],
+        learning_rate=file_config["optimizer"]["lr"],
+        num_epochs=file_config["optimizer"]["epochs"],
+        n_workers=8,
+        save_every=10,
+        checkpoint_dir="checkpoints",
+        wandb_config=wandb_config,  # Pass config
+        project_name="implicit-kernel" # Name your project
     )
     
     trainer.train()
