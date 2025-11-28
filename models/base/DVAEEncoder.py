@@ -1,10 +1,9 @@
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-import sys
 from einops import rearrange
-from ..utils.utils_general import exists, default, eval_decorator
-from .vae import VAEEncoder, VAEDecoder
+from ..utils.utils_general import exists
+from .vae import VAEEncoder
 
 # from utils import utils_distributed
 
