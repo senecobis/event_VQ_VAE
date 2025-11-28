@@ -4,3 +4,4 @@ launch.json
 checkpoints
 *.log
 wandb
+test_results
