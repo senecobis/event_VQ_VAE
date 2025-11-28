@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from einops import rearrange
 from torch.nn import functional as F
-from .DVAEEncoder import DVAEEncoder
+from .base.DVAEEncoder import DVAEEncoder
 from .DVAE import DVAE
 
 class PatchDVAE(DVAE):
